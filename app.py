@@ -7,6 +7,10 @@ import yfinance as yf
 import requests
 from datetime import datetime, timedelta
 import pytz
+import os
+import json
+import time
+from crypto15.fair_value import prob_up, annual_to_per_sec
 
 # --- CONFIG ---
 POLYGON_API_KEY = "v_RMe6XWZMNAcBDzm4PQYNleDd482Ead"
@@ -71,7 +75,7 @@ st.set_page_config(layout="wide", page_title="SPX/VIX Premium Tracker")
 
 st.title("📈 SPX / VIX Premium Tracker (SDTP_Rabon)")
 
-tabs = st.tabs(["📅 Last 7 Days", "📆 Historical"])
+tabs = st.tabs(["📅 Last 7 Days", "📆 Historical", "₿ 15m Crypto"])
 
 # --- TODAY TAB ---
 with tabs[0]:
@@ -122,3 +126,64 @@ with tabs[1]:
             st.dataframe(historical_df, use_container_width=True)
         else:
             st.warning(f"No data available for {date_str}.")
+
+# --- 15 MINUTE CRYPTO TAB ---
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+with tabs[2]:
+    st.subheader("Fair Value Calculator")
+    c1, c2, c3, c4 = st.columns(4)
+    fv_spot = c1.number_input("Spot", value=100000.0, step=10.0)
+    fv_strike = c2.number_input("Price to beat", value=100000.0, step=10.0)
+    fv_mins = c3.number_input("Minutes left", value=7.5, min_value=0.0, max_value=15.0, step=0.5)
+    fv_vol = c4.number_input("Annual vol %", value=45.0, min_value=1.0, step=1.0)
+    p_up = prob_up(fv_spot, fv_strike, annual_to_per_sec(fv_vol / 100), fv_mins * 60)
+    m1, m2 = st.columns(2)
+    m1.metric("Fair value Up", f"{p_up:.3f}")
+    m2.metric("Fair value Down", f"{1 - p_up:.3f}")
+
+    @st.fragment(run_every=1)
+    def live_quoter_panel():
+        st.subheader("Live Paper Quoter")
+        path = os.path.join(DATA_DIR, "quoter_state.json")
+        if not os.path.exists(path):
+            st.info("Start the quoter in a terminal: python -m crypto15.run_quoter")
+            return
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        age = time.time() - state["ts"]
+        if age > 5:
+            st.warning(f"Quoter state is {age:.0f}s old. Is the quoter running?")
+        rows = list(state["coins"].values())
+        cols = ["coin", "spot", "strike", "secs_left", "sigma_annual", "fv",
+                "bid", "ask", "pm_bid", "pm_ask", "inventory", "cash", "divergence_bps", "market"]
+        st.dataframe(pd.DataFrame(rows).reindex(columns=cols), use_container_width=True, hide_index=True)
+        venues = [{"coin": c, "venue": v, **q} for c, vs in state["venues"].items() for v, q in vs.items()]
+        if venues:
+            st.caption("Spot venues (age in seconds)")
+            st.dataframe(pd.DataFrame(venues), use_container_width=True, hide_index=True)
+
+    live_quoter_panel()
+
+    settle_path = os.path.join(DATA_DIR, "settlements.csv")
+    if os.path.exists(settle_path):
+        st.subheader("Paper P&L by Window")
+        sdf = pd.read_csv(settle_path)
+        traded = sdf[sdf["fills"] > 0]
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Total P&L", f"${sdf['pnl'].sum():.2f}")
+        s2.metric("Windows traded", len(traded))
+        s3.metric("Win rate", f"{(traded['pnl'] > 0).mean():.0%}" if len(traded) else "n/a")
+        st.dataframe(sdf.groupby("coin")["pnl"].agg(["sum", "count", "mean"]), use_container_width=True)
+    fills_path = os.path.join(DATA_DIR, "fills.csv")
+    if os.path.exists(fills_path):
+        fdf = pd.read_csv(fills_path)
+        sign = fdf["side"].map({"BUY": 1, "SELL": -1})
+        fdf["edge_at_fill"] = sign * (fdf["fv"] - fdf["price"])
+        fdf["edge_10s"] = sign * (fdf["fv_markout"] - fdf["price"])
+        st.caption("Edge per share: positive means the fill beat fair value. "
+                   "If edge_10s is much lower than edge_at_fill, faster traders are picking off the quotes.")
+        st.dataframe(fdf.tail(200), use_container_width=True, hide_index=True)
